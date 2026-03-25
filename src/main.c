@@ -1,9 +1,15 @@
 #include "main.h"
 
-uint32_t *addr = (uint32_t *)0x08004000;
+uint32_t *addr = (uint32_t *)0x08004000;  // base address sector 1
 volatile uint8_t empty_sectorx = 0;
 
+
 int main() {
+   
+
+    // on reset  it stays in sector 0  mode for 3 seconds , if it receives 0xEE within those 3 seconds it stays
+    // else it jumps to application code in sector 1
+    
     // --- 1. Startup Timer (3s Timeout) ---
     RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;
     TIM2->PSC = 16000 - 1;
@@ -20,6 +26,7 @@ int main() {
     while(1) {
         if (TIM2->SR & TIM_SR_UIF) {
             jump_to_application(0x08004000); // Timeout: Try to jump
+
         }
 
         if ((USART2->SR & USART_SR_RXNE) || empty_sectorx) {
@@ -66,6 +73,7 @@ int main() {
                     break;
 
                 case 0xBB:
+                    
                     USART2_SendString("Jumping...\r\n");
                     jump_to_application(0x08004000);
                     break;

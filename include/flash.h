@@ -1,3 +1,7 @@
+#ifndef FLASH_H
+#define FLASH_H
+
+
 #include "stm32f407xx.h"
 #include "main.h"
 
@@ -20,4 +24,4 @@ void FillHexBuffer(uint8_t bytes_in_line);
 void FillWord(uint8_t words_in_line);
 void jump_to_application(uint32_t app_address);
 
-
+#endif
