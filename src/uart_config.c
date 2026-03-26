@@ -22,7 +22,16 @@ void uart_init() {
 void USART2_SendString(const char *buf) {
     UART_TransmitString(USART2, buf);
 }
-
+void bl_send_response(const char *msg, uint8_t ack_byte) {
+    if (g_boot_mode == MODE_MACHINE) {
+        // Wait for TX buffer to be empty, then send 1 raw byte
+        while (!(USART2->SR & USART_SR_TXE));
+        USART2->DR = ack_byte;
+    } else {
+        // Send human-readable text
+        USART2_SendString((char *)msg);
+    }
+}
 /* Parser State Variables */
 static uint8_t line_pos = 0;
 static uint8_t ascii_idx = 0;

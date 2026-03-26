@@ -4,11 +4,10 @@
 #include "flash.h"
 
 
+
 void USART2_SendString(const char* buf);
 void uart_init();
-
-
-
+void bl_send_response(const char *msg, uint8_t ack_byte) ;
 
 
 extern volatile uint32_t word_buffer[6000];

@@ -12,6 +12,13 @@ extern volatile uint8_t hex_buffer[4*4];
 extern volatile uint32_t final_word[4] ;  
 
 
+typedef enum {
+    MODE_HUMAN,
+    MODE_MACHINE
+} BootMode_t;
+
+extern BootMode_t g_boot_mode ;
+
 
 void flash_unlock();
 void flash_lock(); 
