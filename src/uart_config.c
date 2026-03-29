@@ -42,13 +42,20 @@ static char len_chars[2];
 static char addr_chars[4];
 static uint16_t current_line_offset = 0;
 
+//CHECKSUM VARIABLES 
+static uint8_t running_checksum = 0; 
+static char checksum_chars[2];
+static uint8_t expected_checksum = 0;
+volatile uint8_t checksum_err=0;
+
 void USART2_IRQHandler(void) {
     if (USART2->SR & USART_SR_RXNE) {
         uint8_t rx_byte = USART2->DR;
         
         if (current_state == IDLE) {
+            if (rx_byte != '\r' && rx_byte != '\n' && rx_byte != ' ') {
             CMD = rx_byte;
-            cmd_rdy = 1;  
+            cmd_rdy = 1;  }
         }
         else if (current_state == RECEIVING_DATA) {
             if (rx_byte == ':') {
@@ -57,6 +64,7 @@ void USART2_IRQHandler(void) {
                 record_is_eof = 0;
                 record_is_data = 0;
                 expected_ascii_count = 0;
+                running_checksum = 0; 
                 return; 
             }
 
@@ -68,57 +76,106 @@ void USART2_IRQHandler(void) {
                 len_chars[1] = rx_byte;
                 uint8_t byte_count = (AsciiToNibble(len_chars[0]) << 4) | AsciiToNibble(len_chars[1]);
                 expected_ascii_count = byte_count * 2;
+                
+                running_checksum += byte_count; 
             }
 
-            // 2. Capture Address to Temp
-            static uint16_t temp_addr = 0;
+            // 2. Capture Address
             if (line_pos >= 3 && line_pos <= 6) {
                 addr_chars[line_pos - 3] = rx_byte;
                 if (line_pos == 6) {
-                    uint16_t high = (AsciiToNibble(addr_chars[0]) << 4) | AsciiToNibble(addr_chars[1]);
-                    uint16_t low  = (AsciiToNibble(addr_chars[2]) << 4) | AsciiToNibble(addr_chars[3]);
-                    temp_addr = (high << 8) | low;
+                    uint8_t high = (AsciiToNibble(addr_chars[0]) << 4) | AsciiToNibble(addr_chars[1]);
+                    uint8_t low  = (AsciiToNibble(addr_chars[2]) << 4) | AsciiToNibble(addr_chars[3]);
+                    
+                    running_checksum += high; 
+                    running_checksum += low;  
+                    
+                    current_line_offset = (high << 8) | low;
                 }
             }
 
-            // 3. Record Type Shield (Ignores 04 records)
+            // 3. Record Type
+            if (line_pos == 7) {
+                
+            }
             if (line_pos == 8) {
+                uint8_t type = (AsciiToNibble('0') << 4) | AsciiToNibble(rx_byte); // Assuming type is '00', '01', or '04'
+                running_checksum += type; // Add type to checksum
+
                 if (rx_byte == '0') {
                     record_is_data = 1;
-                    current_line_offset = temp_addr; 
                 } 
                 else if (rx_byte == '1') {
                     record_is_eof = 1;
                 }
                 else {
-                    record_is_data = 0; // Mutes the rest of the line (e.g. Type 04)
+                    record_is_data = 0; // Mutes the rest 
                 }
             }
             
             // 4. Collect & Parse Data
-            else if (line_pos > 8 && record_is_data && expected_ascii_count > 0) {
-                if (ascii_idx < expected_ascii_count && rx_byte != '\r' && rx_byte != '\n') {
+            if (line_pos > 8 && (record_is_data || record_is_eof)) { // EOF lines also have checksums!
+                
+                // --- A. Collecting Data bytes ---
+                if (ascii_idx < expected_ascii_count) {
                     ascii_buffer[ascii_idx++] = rx_byte;
                     
-                    if (ascii_idx == expected_ascii_count) {
-                        uint8_t bytes = expected_ascii_count / 2;
-                        uint8_t words = bytes / 4;
+                   
+                    if (ascii_idx % 2 == 0) {
+                        uint8_t last_byte = (AsciiToNibble(ascii_buffer[ascii_idx - 2]) << 4) | AsciiToNibble(ascii_buffer[ascii_idx - 1]);
+                        running_checksum += last_byte; // Add data byte to checksum
+                    }
 
-                        FillNibbleBuffer(expected_ascii_count);
-                        FillHexBuffer(bytes);
-                        FillWord(words);
+                    if (ascii_idx == expected_ascii_count) {
+                        // Data stream collection is done for this line
+                    }
+                }
+                
+                // --- B. Collecting Checksum bytes (The last 2 characters of the line) ---
+                else {
+                    uint8_t checksum_char_idx = line_pos - 9 - expected_ascii_count;
+                    if (checksum_char_idx == 0) checksum_chars[0] = rx_byte;
+                    if (checksum_char_idx == 1) {
+                        checksum_chars[1] = rx_byte;
+                        expected_checksum = (AsciiToNibble(checksum_chars[0]) << 4) | AsciiToNibble(checksum_chars[1]);
                         
-                        // Maps FLASH offset to RAM buffer index
-                        uint16_t buffer_word_start = (current_line_offset - 0x4000) / 4; 
                         
-                        for(int w = 0; w < words; w++) {
-                            word_buffer[buffer_word_start + w] = final_word[w];
+                        running_checksum += expected_checksum;
+
+                        if (running_checksum != 0) {
+                            // Checksum Failed!
+                            bl_send_response("CHECKSUM ERROR\r\n", 0x1F); // NACK
+                            checksum_err=1;
+                            
+                            // Abort 
+                            line_pos = 0;
+                            return; 
+                        } else {
+                            // Checksum Passed! 
+                            if (g_boot_mode == MODE_MACHINE) {
+                                bl_send_response("", 0x79); // Bare ACK
+                            }
                         }
-                        
-                        if ((buffer_word_start + words) > word_index) {
-                            word_index = buffer_word_start + words;
+
+                        // Checksum is passed. Now we safely process the data
+                        if (record_is_data) {
+                            uint8_t bytes = expected_ascii_count / 2;
+                            uint8_t words = bytes / 4;
+
+                            FillNibbleBuffer(expected_ascii_count);
+                            FillHexBuffer(bytes);
+                            FillWord(words);
+                            
+                            uint16_t buffer_word_start = (current_line_offset - 0x4000) / 4; 
+                            
+                            for(int w = 0; w < words; w++) {
+                                word_buffer[buffer_word_start + w] = final_word[w];
+                            }
+                            
+                            if ((buffer_word_start + words) > word_index) {
+                                word_index = buffer_word_start + words;
+                            }
                         }
-                        expected_ascii_count = 0; 
                     }
                 }
             }

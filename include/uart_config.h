@@ -19,6 +19,8 @@ extern volatile uint8_t transfer_complete ;
 extern volatile uint16_t word_index ;
 extern volatile uint8_t byte_index ;
 
+extern volatile uint8_t checksum_err;
+
 typedef enum {
     IDLE,
     RECEIVING_DATA,

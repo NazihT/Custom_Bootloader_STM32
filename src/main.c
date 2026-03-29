@@ -22,7 +22,6 @@ int main(void) {
         force_bootloader = 1;
     }
 
-    // CRITICAL: Clear the register so it doesn't get stuck here on normal power cycle
     RTC->BKP0R = 0x00000000; 
   
 
@@ -32,7 +31,7 @@ int main(void) {
 
     // --- 3. Entry Polling (Only run if NOT forced by Python/App reset) ---
     if (!force_bootloader) {
-        // Startup Timer (3s Timeout)
+        // Startup Timer (1s Timeout)
         RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;
         TIM2->PSC = 16000 - 1;
         TIM2->ARR = 1000 - 1;
@@ -111,7 +110,7 @@ int main(void) {
             CMD = 0;
         }
 
-        if (transfer_complete) {
+        if (transfer_complete && !checksum_err) {
             flash_write_segment(addr, word_buffer, word_index);
             bl_send_response("Flash Successful. Reset MCU to run.\r\n", 0x79);
             transfer_complete = 0;
