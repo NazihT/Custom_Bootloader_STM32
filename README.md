@@ -1,6 +1,6 @@
 # STM32F4 Custom IAP Bootloader
 
-A bare-metal, protocol-aware In-Application Programming bootloader for the STM32F4, built from scratch with zero HAL dependencies. Supports dual-mode operation (human terminal / automated script), Intel HEX parsing via interrupt-driven FSM, and a full Python flashing pipeline.
+A bare-metal, protocol-aware In-Application Programming bootloader for the STM32F4, built from scratch with zero HAL dependencies. Supports dual-mode operation (human terminal / automated script), Intel HEX parsing via interrupt-driven FSM with per-line checksum verification, and a full Python flashing pipeline.
 
 ---
 
@@ -45,8 +45,12 @@ The bootloader lives in **Sector 0** (0x08000000). The application lives in **Se
 │  0xBB → jump_to_application(0x08004000)             │
 │                                                     │
 │  RECEIVING_DATA state: Intel HEX parser active      │
-│  EOF record received → flash_write_segment()        │
-│                       → ACK → back to IDLE          │
+│  Per-line checksum verified in ISR                  │
+│  Checksum fail → NACK + set checksum_err flag       │
+│  EOF record received → transfer_complete = 1        │
+│  Main loop: if transfer_complete && !checksum_err   │
+│             → flash_write_segment()                 │
+│             → ACK → back to IDLE                    │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -80,31 +84,77 @@ Every response in the codebase goes through `bl_send_response()`. The mode logic
 
 ## Intel HEX Parser
 
-The parser runs entirely in the **USART2 IRQ handler** — no polling, no blocking. It processes the incoming HEX stream character by character as bytes arrive.
+The parser runs entirely in the **USART2 IRQ handler** — no polling, no blocking. It processes the incoming HEX stream character by character as bytes arrive, and verifies the Intel HEX checksum for every line before touching the staging buffer.
 
 **Supported record types:**
 
 | Type | Description | Handled |
 |---|---|---|
-| `00` | Data | ✅ Parsed and buffered |
-| `01` | End of File | ✅ Triggers flash write |
+| `00` | Data | ✅ Parsed, checksum verified, then buffered |
+| `01` | End of File | ✅ Checksum verified, triggers flash write |
 | `04` | Extended Linear Address | ✅ Silently ignored (muted) |
 
 **Parsing pipeline per line:**
 
 ```
-':' received          → reset all line-local state
-pos 1-2  (LLLL)       → byte count → expected_ascii_count
+':' received          → reset all line-local state (including running_checksum)
+pos 1-2  (LL)         → byte count → expected_ascii_count
+                          → running_checksum += byte_count
 pos 3-6  (AAAA)       → 16-bit line offset
+                          → running_checksum += addr_high
+                          → running_checksum += addr_low
 pos 7-8  (TT)         → record type gate (data / EOF / mute)
+                          → running_checksum += type
 pos 9+   (data bytes) → fill ascii_buffer[]
-                          → FillNibbleBuffer()
-                          → FillHexBuffer()   (handles endian swap)
-                          → FillWord()        (pack to uint32_t)
-                          → map offset → word_buffer[] index
-                          → update word_index high-water mark
+                          → running_checksum += each decoded data byte
+checksum field        → decode expected_checksum from last 2 ASCII chars
+                          → running_checksum += expected_checksum
+                          → if running_checksum != 0x00 → NACK + set checksum_err
+                          → if running_checksum == 0x00 → checksum pass
+                            → FillNibbleBuffer()
+                            → FillHexBuffer()   (handles endian swap)
+                            → FillWord()        (pack to uint32_t)
+                            → map offset → word_buffer[] index
+                            → update word_index high-water mark
 EOF '\n' received     → set transfer_complete = 1
 ```
+
+### Checksum Verification
+
+Intel HEX uses a simple two's complement checksum appended to every record. The bootloader verifies it **on every line, inside the ISR**, before any data is written to the staging buffer.
+
+**How it works:**
+
+The running checksum accumulates every decoded byte on the line: byte count, both address bytes, record type, and all data bytes. The final two ASCII characters of each line are the checksum field. Once decoded, it is added to the running total:
+
+```
+running_checksum = byte_count + addr_high + addr_low + type + data[0..N] + expected_checksum
+```
+
+By definition of the Intel HEX format, a valid line always produces a sum of `0x00` (modulo 256). Any deviation means the line is corrupt.
+
+```c
+running_checksum += expected_checksum;
+
+if (running_checksum != 0) {
+    // Checksum Failed
+    bl_send_response("CHECKSUM ERROR\r\n", 0x1F);  // NACK
+    checksum_err = 1;
+    line_pos = 0;
+    return;
+} else {
+    // Checksum Passed — safe to process data
+    if (g_boot_mode == MODE_MACHINE) {
+        bl_send_response("", 0x79);  // Bare ACK
+    }
+}
+```
+
+**Key properties:**
+- Verification runs entirely inside the ISR — zero main-loop overhead.
+- Data is **never written to `word_buffer[]`** until its line checksum passes.
+- `checksum_err` is a sticky flag. Once set, it is never cleared mid-transfer.
+- The flag is checked in the main loop **before** any flash write is allowed.
 
 **Buffer mapping:**
 
@@ -114,7 +164,24 @@ The parser maps each line's flash offset directly to a RAM staging buffer index:
 uint16_t buffer_word_start = (current_line_offset - 0x4000) / 4;
 ```
 
-The entire application image is staged in `word_buffer[6000]` before a single flash write operation. One call to `flash_write_segment()` writes everything.
+The entire application image is staged in `word_buffer[6000]` before a single flash write operation. One call to `flash_write_segment()` writes everything — but only if no checksum error occurred.
+
+---
+
+## Flash Write Guard
+
+After the HEX stream is fully received, the main loop handles the actual flash write. The `transfer_complete` flag alone is not sufficient to trigger a write — the `checksum_err` flag must also be clear:
+
+```c
+if (transfer_complete && !checksum_err) {
+    flash_write_segment(addr, word_buffer, word_index);
+    bl_send_response("Flash Successful. Reset MCU to run.\r\n", 0x79);
+    transfer_complete = 0;
+    current_state = IDLE;
+}
+```
+
+If any line in the HEX stream raised a checksum error, `checksum_err` remains set, `transfer_complete` is ignored, and the flash is never touched. The device stays in bootloader mode with the existing firmware intact.
 
 ---
 
@@ -183,9 +250,12 @@ Script sends 0x2A to APP
 Script sends 0xF1 (Erase S1)  → waits 0x79
 Script sends 0xF2 (Erase S2)  → waits 0x79
 Script sends 0xAA (Prep HEX)  → waits 0x79
-Script streams .hex file       → waits 0x79 (EOF triggers flash write)
+Script streams .hex file       → per-line: waits 0x79 ACK or 0x1F NACK
+                                  0x1F received → abort, corrupted transfer
 Script sends 0xBB (Jump)       → device boots new firmware
 ```
+
+In `MODE_MACHINE`, the bootloader sends a `0x79` ACK after each line's checksum passes. If the Python script receives a `0x1F` NACK at any point, it knows the specific line that failed and can abort the transfer cleanly.
 
 **Dependencies:**
 
@@ -237,15 +307,15 @@ SRAM (192 KB)
 BOOTLOADER/
 ├── Core/
 │   ├── Src/
-│   │   ├── main.c          # Boot logic, RTC read, countdown, FSM
-│   │   ├── flash.c         # Flash unlock/erase/write + HEX parser
+│   │   ├── main.c          # Boot logic, RTC read, countdown, FSM, flash write guard
+│   │   ├── flash.c         # Flash unlock/erase/write + HEX parser + checksum verifier
 │   │   ├── uart_config.c   # UART init, bl_send_response, IRQ handler
-|   |   ├── gpio.c          # GPIO init
+│   │   ├── gpio.c          # GPIO init
 │   └── Inc/
 │       ├── main.h
 │       ├── flash.h
 │       ├── uart_config.h
-|       ├── gpio.h
+│       ├── gpio.h
 ├── script.py                # Automated Python flashing pipeline
 └── README.md
 ```
